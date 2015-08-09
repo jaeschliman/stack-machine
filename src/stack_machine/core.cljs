@@ -30,7 +30,7 @@
 
 
 (def root-env (atom {:bindings {} :parent nil}))
-(def prims {'+ + '- -})
+(def prims {'+ + '- - 'true true 'false false})
 (defn add-primitive-fn [sym]
   (reset! root-env (assoc-in @root-env [:bindings sym] [:prim sym])))
 (add-primitive-fn '+)
@@ -121,6 +121,8 @@
         m (-> m pop-instr)]
     (cond
       (number? v) m
+      (= v true)  m
+      (= v false) m
       (symbol? v)
       (let [v' (lookup-symbol (:env m) v)]
         (println (str "replacing " v " with " v'))
@@ -265,6 +267,25 @@
         (pop-value)
         (assoc :env env))))
 
+(defn special-form-if [m form]
+  (let [[_ test then else] form]
+    (-> m
+        (push-value [then else])
+        (push-value test)
+        (push-instr :if)
+        (push-instr :eval))))
+(add-special-form 'if special-form-if)
+
+(defmethod step :if [m]
+  (let [m           (pop-instr m)
+        bool        (top-value m)
+        m'          (pop-value m)
+        [then else] (top-value m')
+        m''         (pop-value m')]
+    (if bool
+      (-> m'' (push-value then) (push-instr :eval))
+      (-> m'' (push-value else) (push-instr :eval)))))
+
 (defn check [form expected]
   (.groupCollapsed js/console (str form))
   (println "==============================")
@@ -308,6 +329,12 @@
             (let ((plus4 (adder 4)))
               (plus4 5)))
          9)
+  (check 'true true)
+  (check 'false false)
+  (check '(if true 10 20) 10)
+  (check '(if false 10 20) 20)
+  (check '(if (begin true) (+ 5 5) (+ 10 10)) 10)
+  (check '(if (begin false) (+ 5 5) (+ 10 10)) 20)
   (println "all checks run."))
 
 (run-checks)
