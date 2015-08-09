@@ -30,11 +30,13 @@
 
 
 (def root-env (atom {:bindings {} :parent nil}))
-(def prims {'+ + '- - 'true true 'false false})
+(def prims {'+ + '- - '> > '< <})
 (defn add-primitive-fn [sym]
   (reset! root-env (assoc-in @root-env [:bindings sym] [:prim sym])))
 (add-primitive-fn '+)
 (add-primitive-fn '-)
+(add-primitive-fn '>)
+(add-primitive-fn '<)
 (def special-forms (atom {}))
 (defn add-special-form [sym fn]
   (reset! special-forms (assoc @special-forms sym fn)))
@@ -198,8 +200,10 @@
       (let [result (apply fn args)]
         (push-value m result))
       (if (closure? op)
-        (let [[_ closure-env closure-vars body] op
-              env (:env m)]
+        (let [[_ name closure-env closure-vars body] op
+              env (:env m)
+              ;; bind for recursion if closure is named
+              closed (if name (assoc-in closure-env [:bindings name] op) closure-env)]
           (-> m
               (push-instr :set-env)
               (push-value env)
@@ -210,7 +214,7 @@
               (push-value closure-vars)
               (push-value args)
               (push-instr :set-env)
-              (push-value closure-env)))
+              (push-value closed)))
         (throw "don't know how to apply")))))
 
 (defmethod step :swap [m]
@@ -241,7 +245,7 @@
 (defn special-form-lambda [m v]
   (let [[_ vars & body] v]
     (-> m (push-value
-           [:closure (:env m) vars body]))))
+           [:closure nil (:env m) vars body]))))
 (add-special-form 'lambda special-form-lambda)
 
 (defmethod step :pop-env [m]
@@ -286,6 +290,33 @@
       (-> m'' (push-value then) (push-instr :eval))
       (-> m'' (push-value else) (push-instr :eval)))))
 
+(defn special-form-define [m form]
+  (if (list? (second form))
+    (let [[_ [name & args] & body] form
+          env (:env m)
+          closure [:closure name env args body]
+          env' (assoc-in env [:bindings name] closure)]
+      (-> m
+          (assoc :env env')
+          (push-value closure)))
+    (let [[_ name eval] form]
+      (-> m
+          (push-instr :define)
+          (push-value name)
+          (push-instr :eval)
+          (push-value eval)))))
+
+(add-special-form 'define special-form-define)
+(defmethod step :define [m]
+  (let [m (pop-instr m)
+        val (top-value m)
+        m' (pop-value m)
+        sym (top-value m')
+        m'' (pop-value m')]
+    (-> m''
+        (assoc-in [:env :bindings sym] val)
+        (push-value val))))
+
 (defn check [form expected]
   (.groupCollapsed js/console (str form))
   (println "==============================")
@@ -321,7 +352,7 @@
               (+ x a)))
          30)
   (check '(lambda (x) x)
-         [:closure @root-env '(x) '(x)])
+         [:closure nil @root-env '(x) '(x)])
   (check '((lambda (x) x) 10) 10)
   (check '((let ((y 10))
              (lambda () y))) 10)
@@ -335,6 +366,29 @@
   (check '(if false 10 20) 20)
   (check '(if (begin true) (+ 5 5) (+ 10 10)) 10)
   (check '(if (begin false) (+ 5 5) (+ 10 10)) 20)
+
+  (check '(> 3 4) false)
+  (check '(< 3 4) true)
+
+  (check '(define (id x) x) [:closure 'id @root-env '(x) '(x)])
+
+  (check '(begin
+           (define (sub x)
+             (if (> x 2)
+               (sub (- x 1))
+               x))
+           (sub 5))
+         2)
+
+  (check '(begin
+           (define x 10)
+           x) 10)
+  (check '(begin
+           (define x 10)
+           (let ((x 20))
+             x))
+         20)
+  
   (println "all checks run."))
 
 (run-checks)
