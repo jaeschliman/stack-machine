@@ -1,6 +1,9 @@
 (ns ^:figwheel-always stack-machine.core
     (:require[om.core :as om :include-macros true]
-              [om.dom :as dom :include-macros true]))
+             [om.dom :as dom :include-macros true]
+             [cljs.core.async :as async :refer
+              [<! >! chan close! put! alts! timeout]])
+     (:require-macros [cljs.core.async.macros :refer [go alt!]]))
 
 (enable-console-print!)
 
@@ -26,10 +29,10 @@
 )
 
 
-(def root-env (atom {}))
+(def root-env (atom {:bindings {} :parent nil}))
 (def prims {'+ + '- -})
 (defn add-primitive-fn [sym]
-  (reset! root-env (assoc @root-env sym [:prim sym])))
+  (reset! root-env (assoc-in @root-env [:bindings sym] [:prim sym])))
 (add-primitive-fn '+)
 (add-primitive-fn '-)
 (def special-forms (atom {}))
@@ -47,6 +50,12 @@
 (defn special-form? [form]
   (and (list? form)
        (get @special-forms (first form))))
+
+(defn lookup-symbol [env sym]
+  (if (contains? (:bindings env) sym)
+    (get-in env [:bindings sym])
+    (if-let [parent (:parent env)]
+      (lookup-symbol parent sym))))
 
 (defn machine []
   { :stack [] :env @root-env :value-stack []})
@@ -86,6 +95,24 @@
         (if (= next state) state
             (recur next))))))
 
+(defn print-machine [m]
+  (println "--------------------")
+  (println "  control stack:" (:stack m))
+  (println "  value   stack:" (:value-stack m))
+  (println "  environment:  " (:env m)))
+
+(defn evl-slow [form]
+  (let [m (-> (machine)
+              (push-value form)
+              (push-instr :eval))]
+    (go
+      (loop [state m]
+        (print-machine state)
+        (let [next (step state)]
+          (if (= next state) state
+              (do (<! (timeout 1000))
+                  (recur next))))))))
+
 (defmulti step (fn [m] (last (:stack m))))
 
 (defmethod step nil [m] m)
@@ -95,16 +122,16 @@
     (cond
       (number? v) m
       (symbol? v)
-      (let [v' (get-in m [:env v])]
+      (let [v' (lookup-symbol (:env m) v)]
         (println (str "replacing " v " with " v'))
         (swap-value m v'))
       (list?   v)
       (if-let [special-form (special-form? v)]
         (special-form (pop-value m) v)
         (-> m
+            (pop-value)
             (push-instr :apply)
             (push-instr :evalist)
-            (pop-value)
             (push-value v)
             (push-value [])))
       :else (throw "unknown value"))))
@@ -130,21 +157,26 @@
   (-> m pop-instr pop-value))
 
 (defmethod step :evalist [m]
+  ;; [(forms) [empty vec]] -- (evaluated forms)
+  ;; i.e the top of the stack is used to store the forms as they're
+  ;; eval'ed
   (let [m    (pop-instr m)
         done (top-value m)
         m'   (pop-value m)
         rem  (top-value m')
-        m''  (pop-value m')
-        ]
+        m''  (pop-value m')]
     (if (empty? rem)
       ;; expects the next instr. to be waiting on the stack when done
       (-> m'' (push-value done))
       (let [[next & rem'] rem]
         (-> m''
+            ;;loop thru remaining
             (push-instr :evalist)
             (push-value rem')
+            ;;push evaluated result into done
             (push-instr :push)
             (push-value done)
+            ;;evaluate next result
             (push-instr :eval)
             (push-value next))))))
 
@@ -155,13 +187,46 @@
         vec (top-value m')]
     (swap-value m' (conj vec v))))
 
-(defmethod step :apply [m] m
+(defmethod step :apply [m]
   (let [[op & args] (top-value m)
         m (-> m pop-instr pop-value)]
     (if-let [fn (prim-op? op)]
       (let [result (apply fn args)]
         (push-value m result))
       (throw "don't know how to apply"))))
+
+(defn special-form-let [m v]
+  (let [[_ bindings & body] v
+        vars (map first bindings)
+        forms (map second bindings)]
+    (-> m
+        (push-instr :pop-env)
+        (push-instr :progn)
+        (push-value body)
+        (push-instr :push-env)
+        (push-value vars)
+        (push-instr :evalist)
+        (push-value forms)
+        (push-value []))))
+
+(add-special-form 'let special-form-let)
+
+(defmethod step :pop-env [m]
+  (let [parent (:parent (:env m))]
+    (-> m
+        (pop-instr)
+        (assoc :env parent))))
+
+(defmethod step :push-env [m]
+  (let [m    (pop-instr m)
+        vals (top-value m)
+        m'   (pop-value m)
+        vars (top-value m')
+        m''  (pop-value m')
+        bindings (zipmap vars vals)
+        env {:parent (:env m'') :bindings bindings}]
+    (assoc m'' :env env)))
+
 
 (defn check [form expected]
   (.groupCollapsed js/console (str form))
@@ -175,12 +240,28 @@
     (.assert js/console (= val expected)
              (str "unexpected result:" val " is not equal to expected:" expected))))
 
-(println "running checks")
-(check 1 1)
-(check '+ [:prim '+])
-(check '(+ 2 2) 4)
-(check '(+ 6 (+ 2 2)) 10)
-(check '(- 6 (+ 2 2)) 2)
-(check '(begin 1 2 3) 3)
-(check '(+ (begin 1 2) (begin 3 4)) 6)
-(println "all checks run.")
+(defn run-checks []
+  (println "running checks")
+  (check 1 1)
+  (check '+ [:prim '+])
+  (check '(+ 2 2) 4)
+  (check '(+ 6 (+ 2 2)) 10)
+  (check '(- 6 (+ 2 2)) 2)
+  (check '(begin 1 2 3) 3)
+  (check '(+ (begin 1 2) (begin 3 4)) 6)
+  (check '(let ((x 10)) +) [:prim '+])
+  (check '(let ((x 10)) x) 10)
+  (check '(let ((x 10) (y 20))
+            (+ x y))
+         30)
+  (check '(let ((x 10) (y 20))
+            (let ((x y) (a y))
+              (+ x a)))
+         40)
+  (check '(let ((x 10) (y 20))
+            (let ((x y) (a x))
+              (+ x a)))
+         30)
+  (println "all checks run."))
+
+(run-checks)
