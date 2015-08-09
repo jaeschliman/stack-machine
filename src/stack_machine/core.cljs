@@ -187,13 +187,39 @@
         vec (top-value m')]
     (swap-value m' (conj vec v))))
 
+(defn closure? [it]
+  (and (vector? it) (= (first it) :closure)))
 (defmethod step :apply [m]
   (let [[op & args] (top-value m)
         m (-> m pop-instr pop-value)]
     (if-let [fn (prim-op? op)]
       (let [result (apply fn args)]
         (push-value m result))
-      (throw "don't know how to apply"))))
+      (if (closure? op)
+        (let [[_ closure-env closure-vars body] op
+              env (:env m)]
+          (-> m
+              (push-instr :set-env)
+              (push-value env)
+              (push-instr :swap)
+              (push-instr :progn)
+              (push-value body)
+              (push-instr :push-env)
+              (push-value closure-vars)
+              (push-value args)
+              (push-instr :set-env)
+              (push-value closure-env)))
+        (throw "don't know how to apply")))))
+
+(defmethod step :swap [m]
+  (let [m   (pop-instr m)
+        a   (top-value m)
+        m'  (pop-value m)
+        b   (top-value m')
+        m'' (pop-value m')]
+    (-> m''
+        (push-value a)
+        (push-value b))))
 
 (defn special-form-let [m v]
   (let [[_ bindings & body] v
@@ -208,8 +234,13 @@
         (push-instr :evalist)
         (push-value forms)
         (push-value []))))
-
 (add-special-form 'let special-form-let)
+
+(defn special-form-lambda [m v]
+  (let [[_ vars & body] v]
+    (-> m (push-value
+           [:closure (:env m) vars body]))))
+(add-special-form 'lambda special-form-lambda)
 
 (defmethod step :pop-env [m]
   (let [parent (:parent (:env m))]
@@ -227,6 +258,12 @@
         env {:parent (:env m'') :bindings bindings}]
     (assoc m'' :env env)))
 
+(defmethod step :set-env [m]
+  (let [env (top-value m)]
+    (-> m
+        (pop-instr)
+        (pop-value)
+        (assoc :env env))))
 
 (defn check [form expected]
   (.groupCollapsed js/console (str form))
@@ -262,6 +299,15 @@
             (let ((x y) (a x))
               (+ x a)))
          30)
+  (check '(lambda (x) x)
+         [:closure @root-env '(x) '(x)])
+  (check '((lambda (x) x) 10) 10)
+  (check '((let ((y 10))
+             (lambda () y))) 10)
+  (check '(let ((adder (lambda (n) (lambda (x) (+ n x)))))
+            (let ((plus4 (adder 4)))
+              (plus4 5)))
+         9)
   (println "all checks run."))
 
 (run-checks)
