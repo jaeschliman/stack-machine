@@ -32,11 +32,21 @@
   (reset! root-env (assoc @root-env sym [:prim sym])))
 (add-primitive-fn '+)
 (add-primitive-fn '-)
+(def special-forms (atom {}))
+(defn add-special-form [sym fn]
+  (reset! special-forms (assoc @special-forms sym fn)))
 
+;; tests the value before application
 (defn prim-op? [it]
   (and (vector? it)
        (= :prim (first it))
        (get prims (second it))))
+
+
+;; tests the form before evaluation
+(defn special-form? [form]
+  (and (list? form)
+       (get @special-forms (first form))))
 
 (defn machine []
   { :stack [] :env @root-env :value-stack []})
@@ -89,12 +99,35 @@
         (println (str "replacing " v " with " v'))
         (swap-value m v'))
       (list?   v)
-      (-> m
-          (push-instr :evalist)
-          (pop-value)
-          (push-value v)
-          (push-value []))
+      (if-let [special-form (special-form? v)]
+        (special-form (pop-value m) v)
+        (-> m
+            (push-instr :apply)
+            (push-instr :evalist)
+            (pop-value)
+            (push-value v)
+            (push-value [])))
       :else (throw "unknown value"))))
+
+(defn special-form-begin [m v]
+  (-> m
+      (push-value (rest v))
+      (push-instr :progn)))
+(add-special-form 'begin special-form-begin)
+(defmethod step :progn [m]
+  (let [[form & rest] (top-value m)
+        m (-> m pop-instr pop-value)]
+    (if-not rest
+      (-> m (push-instr :eval) (push-value form))
+      (-> m
+          (push-instr :progn)
+          (push-value rest)
+          (push-instr :discard)
+          (push-instr :eval)
+          (push-value form)))))
+
+(defmethod step :discard [m]
+  (-> m pop-instr pop-value))
 
 (defmethod step :evalist [m]
   (let [m    (pop-instr m)
@@ -104,7 +137,8 @@
         m''  (pop-value m')
         ]
     (if (empty? rem)
-      (-> m'' (push-instr :apply) (push-value done))
+      ;; expects the next instr. to be waiting on the stack when done
+      (-> m'' (push-value done))
       (let [[next & rem'] rem]
         (-> m''
             (push-instr :evalist)
@@ -141,8 +175,12 @@
     (.assert js/console (= val expected)
              (str "unexpected result:" val " is not equal to expected:" expected))))
 
+(println "running checks")
 (check 1 1)
 (check '+ [:prim '+])
 (check '(+ 2 2) 4)
 (check '(+ 6 (+ 2 2)) 10)
 (check '(- 6 (+ 2 2)) 2)
+(check '(begin 1 2 3) 3)
+(check '(+ (begin 1 2) (begin 3 4)) 6)
+(println "all checks run.")
