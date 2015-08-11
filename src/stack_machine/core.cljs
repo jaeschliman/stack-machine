@@ -30,13 +30,24 @@
 
 
 (def root-env (atom {:bindings {} :parent nil}))
-(def prims {'+ + '- - '> > '< <})
+(def prims {'+ + '- - '> > '< < 'number? number?})
 (defn add-primitive-fn [sym]
   (reset! root-env (assoc-in @root-env [:bindings sym] [:prim sym])))
 (add-primitive-fn '+)
 (add-primitive-fn '-)
 (add-primitive-fn '>)
 (add-primitive-fn '<)
+(add-primitive-fn 'number?)
+
+;; special operations are special first class functions
+;; which take the machine as first argument and run built-in fn
+;; (and take the rest of their arguments evaluated)
+(def special-ops (atom {}))
+(defn add-special-op [sym fn]
+  (reset! special-ops (assoc @special-ops sym fn)))
+
+;; special forms are built-ins by name (e.g. if, quote)
+;; which have custom evaluation semantics
 (def special-forms (atom {}))
 (defn add-special-form [sym fn]
   (reset! special-forms (assoc @special-forms sym fn)))
@@ -47,6 +58,11 @@
        (= :prim (first it))
        (get prims (second it))))
 
+;; tests the value before application
+(defn special-op? [it]
+  (and (vector? it)
+       (= :special (first it))
+       (get @special-ops (second it))))
 
 ;; tests the form before evaluation
 (defn special-form? [form]
@@ -122,15 +138,21 @@
   (let [v (top-value m)
         m (-> m pop-instr)]
     (cond
+      ;; self-evaluating forms
       (number? v) m
       (= v true)  m
       (= v false) m
+      (vector? v) m ;;closures etc are self-evaluating
+      ;; symbol-value
       (symbol? v)
       (let [v' (lookup-symbol (:env m) v)]
         (println (str "replacing " v " with " v'))
         (swap-value m v'))
-      (list?   v)
+      ;; for list:
+      (list? v)
+      ;; apply special form if found
       (if-let [special-form (special-form? v)]
+        ;; otherwise eval each member and apply first to rest
         (special-form (pop-value m) v)
         (-> m
             (pop-value)
@@ -138,13 +160,14 @@
             (push-instr :evalist)
             (push-value v)
             (push-value [])))
-      :else (throw "unknown value"))))
+      :else (throw (str "unknown value: " v)))))
 
 (defn special-form-begin [m v]
   (-> m
       (push-value (rest v))
       (push-instr :progn)))
 (add-special-form 'begin special-form-begin)
+
 (defmethod step :progn [m]
   (let [[form & rest] (top-value m)
         m (-> m pop-instr pop-value)]
@@ -193,29 +216,37 @@
 
 (defn closure? [it]
   (and (vector? it) (= (first it) :closure)))
+
 (defmethod step :apply [m]
-  (let [[op & args] (top-value m)
-        m (-> m pop-instr pop-value)]
+  (let [form        (top-value m)
+        [op & args] form
+        m           (-> m pop-instr pop-value)]
+    ;; [:prim ]
     (if-let [fn (prim-op? op)]
       (let [result (apply fn args)]
         (push-value m result))
-      (if (closure? op)
-        (let [[_ name closure-env closure-vars body] op
-              env (:env m)
-              ;; bind for recursion if closure is named
-              closed (if name (assoc-in closure-env [:bindings name] op) closure-env)]
-          (-> m
-              (push-instr :set-env)
-              (push-value env)
-              (push-instr :swap)
-              (push-instr :progn)
-              (push-value body)
-              (push-instr :push-env)
-              (push-value closure-vars)
-              (push-value args)
-              (push-instr :set-env)
-              (push-value closed)))
-        (throw "don't know how to apply")))))
+      ;; [:special...]
+      (if-let [op-fn (special-op? op)]
+        (op-fn m op args)
+        ;; [:closure...]
+        (if (closure? op)
+          (let [[_ name closure-env closure-vars body] op
+                env (:env m)
+                ;; bind for recursion if closure is named
+                closed (if name (assoc-in closure-env [:bindings name] op) closure-env)]
+            (-> m
+                (push-instr :set-env)
+                (push-value env)
+                (push-instr :swap)
+                (push-instr :progn)
+                (push-value body)
+                (push-instr :push-env)
+                (push-value closure-vars)
+                (push-value args)
+                (push-instr :set-env)
+                (push-value closed)))
+          (throw (str "don't know how to apply: "
+                      form)))))))
 
 (defmethod step :swap [m]
   (let [m   (pop-instr m)
@@ -305,9 +336,10 @@
           (push-value name)
           (push-instr :eval)
           (push-value eval)))))
-
 (add-special-form 'define special-form-define)
+
 (defmethod step :define [m]
+  ;; extends the current env w/ sym and val on the stack
   (let [m (pop-instr m)
         val (top-value m)
         m' (pop-value m)
@@ -316,6 +348,44 @@
     (-> m''
         (assoc-in [:env :bindings sym] val)
         (push-value val))))
+
+;; like let, but with a special reset op provided
+;; (with-reset reset ((a 10) (b 20)) ...)
+(defn special-form-with-reset [m form]
+  (let [[_ reset-name bindings & body] form
+        vars  (map first bindings)
+        forms (map second bindings)
+        op [:special 'reset reset-name vars m body]
+        vars' (conj vars reset-name)
+        forms' (conj forms op)
+        ]
+    (-> m
+        (push-instr :pop-env)
+        (push-instr :progn)
+        (push-value body)
+        (push-value vars')
+        (push-instr :push-env)
+        (push-instr :evalist)
+        (push-value forms')
+        (push-value []))))
+(add-special-form 'with-reset special-form-with-reset)
+
+(defn special-op-reset [m op args]
+  (let [[_ _ reset-name vars machine-state body] op
+        vars' (conj vars reset-name)
+        args' (conj args op)
+        ]
+    ;; return to previous machine state
+    ;; with fresh values for args
+    (-> machine-state
+        (push-instr :pop-env)
+        (push-instr :progn)
+        (push-value body)
+        (push-instr :push-env)
+        (push-value vars')
+        ;; already eval'd
+        (push-value args'))))
+(add-special-op 'reset special-op-reset)
 
 (defn check [form expected]
   (.groupCollapsed js/console (str form))
@@ -327,7 +397,8 @@
     (println "=>" val)
     (.groupEnd js/console)
     (.assert js/console (= val expected)
-             (str "unexpected result:" val " is not equal to expected:" expected))))
+             (str "unexpected result:" val
+                  " is not equal to expected:" expected))))
 
 (defn run-checks []
   (println "running checks")
@@ -389,6 +460,28 @@
              x))
          20)
   
+  (check '(with-reset jump ((x 10))
+            x) 10)
+
+  (check '(with-reset jump ((n 10))
+            (if (> n 1)
+              (jump (- n 1))
+              n)) 1)
+
+  (check
+   '(begin
+     (define (jumper y)
+       (with-reset jump-back ((x y))
+         (if (> x 10)
+           42
+           jump-back)))
+     (let ((jump (jumper 5)))
+       ;; yow!
+       (if (number? jump)
+         jump
+         (jump 100))))
+   42)
+
   (println "all checks run."))
 
 (run-checks)
