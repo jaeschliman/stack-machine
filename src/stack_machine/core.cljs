@@ -1,6 +1,7 @@
 (ns ^:figwheel-always stack-machine.core
     (:require[om.core :as om :include-macros true]
              [om.dom :as dom :include-macros true]
+             [clojure.string :as string]
              [cljs.core.async :as async :refer
               [<! >! chan close! put! alts! timeout]])
      (:require-macros [cljs.core.async.macros :refer [go alt!]]))
@@ -28,9 +29,19 @@
   ;; (swap! app-state update-in [:__figwheel_counter] inc)
 )
 
+(defn prim-str [thing]
+  (if (vector? thing)
+    (let [[tag name] thing]
+      (str "#<" tag " " name ">"))
+    (str thing)))
+
+(defn trace! [& args]
+  (let [res (string/join " " (map prim-str args))]
+    (println res)
+    res))
 
 (def root-env (atom {:bindings {} :parent nil}))
-(def prims {'+ + '- - '> > '< < 'number? number?})
+(def prims {'+ + '- - '> > '< < 'number? number? 'trace! trace!})
 (defn add-primitive-fn [sym]
   (reset! root-env (assoc-in @root-env [:bindings sym] [:prim sym])))
 (add-primitive-fn '+)
@@ -38,6 +49,7 @@
 (add-primitive-fn '>)
 (add-primitive-fn '<)
 (add-primitive-fn 'number?)
+(add-primitive-fn 'trace!)
 
 ;; special operations are special first class functions
 ;; which take the machine as first argument and run built-in fn
@@ -139,6 +151,7 @@
         m (-> m pop-instr)]
     (cond
       ;; self-evaluating forms
+      (string? v) m
       (number? v) m
       (= v true)  m
       (= v false) m
@@ -146,7 +159,7 @@
       ;; symbol-value
       (symbol? v)
       (let [v' (lookup-symbol (:env m) v)]
-        (println (str "replacing " v " with " v'))
+        ;; (println (str "replacing " v " with " v'))
         (swap-value m v'))
       ;; for list:
       (list? v)
@@ -393,7 +406,7 @@
   (println form)
   (println "------------------------------")
   (let [res (evl form) val (top-value res)]
-    (println res)
+    ;; (println res)
     (println "=>" val)
     (.groupEnd js/console)
     (.assert js/console (= val expected)
@@ -403,6 +416,7 @@
 (defn run-checks []
   (println "running checks")
   (check 1 1)
+  (check "hello" "hello")
   (check '+ [:prim '+])
   (check '(+ 2 2) 4)
   (check '(+ 6 (+ 2 2)) 10)
@@ -476,7 +490,7 @@
            42
            jump-back)))
      (let ((jump (jumper 5)))
-       ;; yow!
+       (trace! "jump =" jump)
        (if (number? jump)
          jump
          (jump 100))))
