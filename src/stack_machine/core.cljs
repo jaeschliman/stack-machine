@@ -143,7 +143,12 @@
               (do (<! (timeout 1000))
                   (recur next))))))))
 
-(defmulti step (fn [m] (last (:stack m))))
+(defmulti step
+  (fn [m]
+    (let [instr (last (:stack m))]
+      (if (vector? instr)
+        (first instr)
+        instr))))
 
 (defmethod step nil [m] m)
 (defmethod step :eval [m]
@@ -230,6 +235,9 @@
 (defn closure? [it]
   (and (vector? it) (= (first it) :closure)))
 
+(defmethod step :block [m]
+  (-> m pop-instr))
+
 (defmethod step :apply [m]
   (let [form        (top-value m)
         [op & args] form
@@ -248,6 +256,7 @@
                 ;; bind for recursion if closure is named
                 closed (if name (assoc-in closure-env [:bindings name] op) closure-env)]
             (-> m
+                (push-instr [:block name m])
                 (push-instr :set-env)
                 (push-value env)
                 (push-instr :swap)
@@ -400,6 +409,21 @@
         (push-value args'))))
 (add-special-op 'reset special-op-reset)
 
+(defn special-form-return-from [m form]
+  (let [[_ label result-form] form
+        block? #(and (vector? %)
+                     (= :block (first %))
+                     (= label  (second %)))
+        blocks (seq (filter block? (:stack m)))]
+    (if (= 0 (count blocks))
+      (throw (str "no label" label "found"))
+      (let [block (last blocks)
+            [_ _ state] block]
+        (-> state
+            (push-value result-form)
+            (push-instr :eval))))))
+(add-special-form 'return-from special-form-return-from)
+
 (defn check [form expected]
   (.groupCollapsed js/console (str form))
   (println "==============================")
@@ -495,6 +519,33 @@
          jump
          (jump 100))))
    42)
+
+  (check
+   '(begin
+     (define (foo)
+       (return-from foo 10)
+       11)
+     (foo))
+   10)
+
+  (check
+   '(begin
+     (define (foo)
+       (return-from foo (+ 3 4))
+       11)
+     (foo))
+   7)
+
+  (check
+   '(begin
+     (define (bar)
+       (return-from foo 12)
+       34)
+     (define (foo)
+       (bar)
+       56)
+     (foo))
+   12)
 
   (println "all checks run."))
 
