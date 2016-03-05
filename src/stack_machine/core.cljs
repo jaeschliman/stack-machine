@@ -29,6 +29,9 @@
   ;; (swap! app-state update-in [:__figwheel_counter] inc)
 )
 
+
+;; vectors with a tag as the first element are used to implement
+;; primitives such as built-in functions, closures, etc.
 (defn prim-str [thing]
   (if (vector? thing)
     (let [[tag name] thing]
@@ -81,14 +84,32 @@
   (and (list? form)
        (get @special-forms (first form))))
 
+;; identifies a closure
+(defn closure? [it]
+  (and (vector? it) (= (first it) :closure)))
+
 (defn lookup-symbol [env sym]
   (if (contains? (:bindings env) sym)
     (get-in env [:bindings sym])
     (if-let [parent (:parent env)]
       (lookup-symbol parent sym))))
 
+;; create an empty machine with empty value and control stacks,
+;; and the current root environment
 (defn machine []
   { :stack [] :env @root-env :value-stack []})
+
+(defn print-machine [m]
+  (println "--------------------")
+  (println "  control stack:" (:stack m))
+  (println "  value   stack:" (:value-stack m))
+  (println "  environment:  " (:env m)))
+
+
+;; helpers to create the stack modifier and reader functions
+;; (defined below). the functions all take a machine state,
+;; and sometimes an additional value, and return a new machine
+;; state. this allows easy composition with the thrush combinator
 (defn pusher [key]
   (fn [m v]
     (let [stack (key m)]
@@ -106,6 +127,7 @@
     (let [stack (key m)]
       (last (get m key)))))
 
+;; our pushers and poppers etc
 (def push-instr (pusher :stack))
 (def push-value (pusher :value-stack))
 (def swap-instr (swapper :stack))
@@ -115,7 +137,19 @@
 (def top-instr  (topper :stack))
 (def top-value  (topper :value-stack))
 
-(declare step)
+;; the step function defines the various primitives that can run
+;; on the control stack (defined below). it is the function used
+;; to transition the machine from one state to the next
+(defmulti step
+  (fn [m]
+    (let [instr (last (:stack m))]
+      (if (vector? instr)
+        (first instr)
+        instr))))
+
+;; our 'eval' function. starts with a bare machine,
+;; pushes the supplied form and the eval instruction,
+;; then runs `step' over the machine until it halts
 (defn evl [form]
   (let [m (-> (machine)
               (push-value form)
@@ -125,12 +159,8 @@
         (if (= next state) state
             (recur next))))))
 
-(defn print-machine [m]
-  (println "--------------------")
-  (println "  control stack:" (:stack m))
-  (println "  value   stack:" (:value-stack m))
-  (println "  environment:  " (:env m)))
-
+;; the same as `eval' but slowly prints each intermediate state
+;; to the console (can help with debugging)
 (defn evl-slow [form]
   (let [m (-> (machine)
               (push-value form)
@@ -143,42 +173,85 @@
               (do (<! (timeout 1000))
                   (recur next))))))))
 
-(defmulti step
-  (fn [m]
-    (let [instr (last (:stack m))]
-      (if (vector? instr)
-        (first instr)
-        instr))))
 
+;; when there is nothing on the control stack, do nothing.
 (defmethod step nil [m] m)
+
+;; the eval instruction
 (defmethod step :eval [m]
-  (let [v (top-value m)
-        m (-> m pop-instr)]
+  (let [v (top-value m)     ;;take (not pop) the top value
+        m (-> m pop-instr)] ;;pop :eval
     (cond
-      ;; self-evaluating forms
+      ;; self-evaluating forms return the value unchanged
       (string? v) m
       (number? v) m
       (= v true)  m
       (= v false) m
       (vector? v) m ;;closures etc are self-evaluating
-      ;; symbol-value
+
+      ;; symbols are swapped with their value in the current
+      ;; environment
       (symbol? v)
       (let [v' (lookup-symbol (:env m) v)]
-        ;; (println (str "replacing " v " with " v'))
         (swap-value m v'))
-      ;; for list:
+
+      ;; for lists:
       (list? v)
-      ;; apply special form if found
       (if-let [special-form (special-form? v)]
-        ;; otherwise eval each member and apply first to rest
-        (special-form (pop-value m) v)
+        ;; apply special form if found
         (-> m
-            (pop-value)
+            (pop-value) ;; pop the list
+            (special-form v))
+        ;; otherwise eval each member and apply first to rest
+        (-> m
+            (pop-value) ;;pop the list
+
+            ;; 2. apply first of list to rest
             (push-instr :apply)
+            ;; 1. evaluate members of list
             (push-instr :evalist)
+            ;; (evalist expects two arguments, the forms remaining
+            ;; to be evaluated, and the forms which have already been
+            ;; evaluated)
             (push-value v)
             (push-value [])))
+
+      ;;otherwise, bogus value
       :else (throw (str "unknown value: " v)))))
+
+(defmethod step :evalist [m]
+  ;; evalist expects two arguments, the forms remaining
+  ;; to be evaluated, and the forms which have already been
+  ;; evaluated.
+  (let [m    (pop-instr m)  ;; :evalist
+        done (top-value m)  ;; the already evaluated values
+        m'   (pop-value m) 
+        rem  (top-value m') ;; the forms remaining to be evaluated
+        m''  (pop-value m')]
+    (if (empty? rem)
+      ;; if none remain to eval just push the result
+      ;; (expects the next instr. to be waiting on the stack when done)
+      (-> m'' (push-value done))
+      ;; otherwise peel off one form and set up its evaluation
+      (let [[next & rem'] rem]
+        (-> m''
+            ;;3. loop thru remaining
+            (push-instr :evalist)
+            (push-value rem')
+            ;;2. push evaluated result into done
+            (push-instr :push)
+            (push-value done)
+            ;;1. evaluate next result
+            (push-instr :eval)
+            (push-value next))))))
+
+(defmethod step :push [m]
+  ;; conj the top of the value stack onto the value below it
+  (let [m (pop-instr m)
+        v (top-value m)
+        m' (pop-value m)
+        vec (top-value m')]
+    (swap-value m' (conj vec v))))
 
 (defn special-form-begin [m v]
   (-> m
@@ -201,39 +274,6 @@
 (defmethod step :discard [m]
   (-> m pop-instr pop-value))
 
-(defmethod step :evalist [m]
-  ;; [(forms) [empty vec]] -- (evaluated forms)
-  ;; i.e the top of the stack is used to store the forms as they're
-  ;; eval'ed
-  (let [m    (pop-instr m)
-        done (top-value m)
-        m'   (pop-value m)
-        rem  (top-value m')
-        m''  (pop-value m')]
-    (if (empty? rem)
-      ;; expects the next instr. to be waiting on the stack when done
-      (-> m'' (push-value done))
-      (let [[next & rem'] rem]
-        (-> m''
-            ;;loop thru remaining
-            (push-instr :evalist)
-            (push-value rem')
-            ;;push evaluated result into done
-            (push-instr :push)
-            (push-value done)
-            ;;evaluate next result
-            (push-instr :eval)
-            (push-value next))))))
-
-(defmethod step :push [m]
-  (let [m (pop-instr m)
-        v (top-value m)
-        m' (pop-value m)
-        vec (top-value m')]
-    (swap-value m' (conj vec v))))
-
-(defn closure? [it]
-  (and (vector? it) (= (first it) :closure)))
 
 (defmethod step :block [m]
   (-> m pop-instr))
