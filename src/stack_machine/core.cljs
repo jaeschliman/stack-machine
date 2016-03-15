@@ -413,18 +413,23 @@
 
 ;; like let, but with a special reset op provided
 ;; (with-reset reset ((a 10) (b 20)) ...)
+;; this is the looping primitive in the language.
 (defn special-form-with-reset [m form]
   (let [[_ reset-name bindings & body] form
         vars  (map first bindings)
         forms (map second bindings)
+        ;; the special form for the reset op -- includes the body
         op [:special 'reset reset-name vars m body]
+        ;; include the reset op as a bound var
         vars' (conj vars reset-name)
         forms' (conj forms op)
         ]
     (-> m
         (push-instr :pop-env)
+        ;; execute the body
         (push-instr :progn)
         (push-value body)
+        ;; eval and bind the provided vars
         (push-value vars')
         (push-instr :push-env)
         (push-instr :evalist)
@@ -432,17 +437,19 @@
         (push-value []))))
 (add-special-form 'with-reset special-form-with-reset)
 
+;; the implementation of the reset op provided by with-reset
 (defn special-op-reset [m op args]
   (let [[_ _ reset-name vars machine-state body] op
         vars' (conj vars reset-name)
         args' (conj args op)
         ]
     ;; return to previous machine state
-    ;; with fresh values for args
     (-> machine-state
         (push-instr :pop-env)
+        ;; execute the body
         (push-instr :progn)
         (push-value body)
+        ;; bind the vars to the fresh values
         (push-instr :push-env)
         (push-value vars')
         ;; already eval'd
