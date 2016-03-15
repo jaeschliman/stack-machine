@@ -1,6 +1,17 @@
 # stack-machine
 
-FIXME: Write a one-line description of your library/project.
+An little programming language written in clojurescript as an
+experiment in just how inefficient I could make an implementation :)
+all output goes through console.log at the moment.
+
+The interesting part of this project (aside from the fun of
+clojurescript itself) is the language implementation: it runs on an
+immutable stack machine, with an instruction and a value stack, and a
+binding environment. When the top instruction is executed, it returns
+a new immutable machine state. Where it gets interesting is the fact
+that an instruction or special form can store the previous machine
+state in the new machine state -- allowing for a sort of time
+travel. This is in fact how looping is implemented in the language.
 
 ## Overview
 
